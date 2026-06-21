@@ -4,7 +4,7 @@ import { cors } from "hono/cors";
 import { readFile } from "node:fs/promises";
 import { createOAuthRouter } from "../auth/oauth.ts";
 import { authenticateBearer } from "./middleware.ts";
-import { handleMcpGet, handleMcpPost } from "./mcp-endpoints.ts";
+import { handleMcpGet, handleMcpPost, handleMcpDelete } from "./mcp-endpoints.ts";
 
 export interface ServerConfig {
   oauthConfig: {
@@ -81,6 +81,7 @@ export function createApp(config: ServerConfig) {
 
   app.get(MCP_ENDPOINT, authenticateBearer, handleMcpGet);
   app.post(MCP_ENDPOINT, authenticateBearer, handleMcpPost);
+  app.delete(MCP_ENDPOINT, authenticateBearer, handleMcpDelete);
 
   app.get("/.well-known/oauth-authorization-server", (c) => {
     const baseUrl = new URL(c.req.url).origin;

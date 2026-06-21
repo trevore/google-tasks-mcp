@@ -1,222 +1,96 @@
 import { Context } from "hono";
+import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
-import { HonoSSETransport, sessionManager } from "../transport/mcp-transport.ts";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { registerAllTools } from "../tools/index.ts";
 import { createLogger } from "../utils/logger.ts";
 
 const logger = createLogger({ component: "mcp-endpoints" });
 
-export async function handleMcpGet(c: Context) {
-  const sessionId = c.req.header("Mcp-Session-Id") || crypto.randomUUID();
-  const mcpAccessToken = c.get("mcpToken") as string;
+// Live MCP transports keyed by Mcp-Session-Id (in-memory; single process).
+// The official StreamableHTTPServerTransport persists a session across the
+// separate POSTs a client makes (initialize, then tools/list, etc.) and returns
+// each request's response in that request's body — which the previous hand-rolled
+// SSE-only transport did not, so Claude saw "no tools".
+const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-  const existingSession = sessionManager.getSession(sessionId);
-  if (existingSession) {
-    logger.info("Closing existing MCP session to establish new connection");
-    await existingSession.transport.close();
-    sessionManager.deleteSession(sessionId);
-  }
-
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const encoder = new TextEncoder();
-
-  const writeSSE = async (data: string, event?: string) => {
-    try {
-      if (event) {
-        await writer.write(encoder.encode(`event: ${event}\n`));
-      }
-      await writer.write(encoder.encode(`data: ${data}\n\n`));
-    } catch {
-      // Silently handle write errors
-    }
+// @hono/node-server exposes the raw Node req/res on c.env; the SDK transport
+// writes directly to them, so we hand the response back with RESPONSE_ALREADY_SENT.
+function nodeReqRes(c: Context) {
+  return c.env as unknown as {
+    incoming: import("node:http").IncomingMessage;
+    outgoing: import("node:http").ServerResponse;
   };
-
-  const transport = new HonoSSETransport();
-  transport.attachStream({
-    writeSSE: async (data: { data: string; event?: string; id?: string }) => {
-      await writeSSE(data.data, data.event);
-    },
-    close: () => {
-      writer.close();
-    },
-  });
-
-  (async () => {
-    try {
-      const sessionServer = new McpServer(
-        {
-          name: "google-tasks-mcp",
-          version: "1.0.0",
-        },
-        {
-          capabilities: {
-            tools: {},
-          },
-        }
-      );
-
-      registerAllTools(sessionServer, mcpAccessToken);
-
-      try {
-        await sessionServer.connect(transport);
-
-        sessionManager.createSession(sessionId, transport);
-        logger.info("MCP session established via GET");
-
-        c.req.raw.signal.addEventListener("abort", () => {
-          logger.info("MCP connection closed by client");
-          sessionManager.deleteSession(sessionId);
-        });
-
-        const heartbeat = setInterval(async () => {
-          try {
-            await writeSSE("", "ping");
-          } catch {
-            clearInterval(heartbeat);
-          }
-        }, 15000);
-
-        c.req.raw.signal.addEventListener("abort", () => {
-          clearInterval(heartbeat);
-          sessionManager.deleteSession(sessionId);
-        });
-
-      } catch {
-        logger.error("Failed to connect MCP server to transport");
-        sessionManager.deleteSession(sessionId);
-        writer.close();
-      }
-    } catch {
-      logger.error("Failed to initialize MCP session");
-      writer.close();
-    }
-  })();
-
-  const headers = {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
-    "Mcp-Session-Id": sessionId,
-  };
-
-  return new Response(readable, { headers });
 }
 
 export async function handleMcpPost(c: Context) {
-  let sessionId = c.req.header("Mcp-Session-Id");
   const mcpToken = c.get("mcpToken") as string;
+  const sessionId = c.req.header("mcp-session-id");
+  const body = await c.req.json();
 
-  if (!sessionId) {
-    sessionId = crypto.randomUUID();
-    const message = await c.req.json() as JSONRPCMessage;
+  let transport: StreamableHTTPServerTransport;
 
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-
-    const writeSSE = async (data: string, event?: string) => {
-      try {
-        if (event) {
-          await writer.write(encoder.encode(`event: ${event}\n`));
-        }
-        await writer.write(encoder.encode(`data: ${data}\n\n`));
-      } catch {
-        // Silently handle write errors
-      }
-    };
-
-    const transport = new HonoSSETransport();
-    transport.attachStream({
-      writeSSE: async (data: { data: string; event?: string; id?: string }) => {
-        await writeSSE(data.data, data.event);
-      },
-      close: () => {
-        writer.close();
+  if (sessionId && transports[sessionId]) {
+    transport = transports[sessionId];
+  } else if (!sessionId && isInitializeRequest(body)) {
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sid) => {
+        transports[sid] = transport;
+        logger.info("MCP session initialized");
       },
     });
-
-    (async () => {
-      try {
-        const sessionServer = new McpServer(
-          {
-            name: "google-tasks-mcp",
-            version: "1.0.0",
-          },
-          {
-            capabilities: {
-              tools: {},
-            },
-          }
-        );
-
-        registerAllTools(sessionServer, mcpToken);
-
-        await sessionServer.connect(transport);
-
-        sessionManager.createSession(sessionId!, transport);
-        logger.info("MCP session established via POST");
-
-        await transport.handleIncomingMessage(message);
-
-        c.req.raw.signal.addEventListener("abort", () => {
-          logger.info("MCP connection closed by client");
-          sessionManager.deleteSession(sessionId!);
-        });
-
-        const heartbeat = setInterval(async () => {
-          try {
-            await writeSSE("", "ping");
-          } catch {
-            clearInterval(heartbeat);
-          }
-        }, 15000);
-
-        c.req.raw.signal.addEventListener("abort", () => {
-          clearInterval(heartbeat);
-          sessionManager.deleteSession(sessionId!);
-        });
-
-      } catch {
-        logger.error("Failed to initialize MCP session via POST");
-        sessionManager.deleteSession(sessionId!);
-        writer.close();
+    transport.onclose = () => {
+      if (transport.sessionId && transports[transport.sessionId]) {
+        delete transports[transport.sessionId];
+        logger.info("MCP session closed");
       }
-    })();
-
-    const headers = {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no",
-      "Mcp-Session-Id": sessionId,
     };
 
-    return new Response(readable, { headers });
+    const server = new McpServer(
+      { name: "google-tasks-mcp", version: "1.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    registerAllTools(server, mcpToken);
+    await server.connect(transport);
+  } else {
+    return c.json(
+      { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: no valid session ID" }, id: null },
+      400,
+    );
   }
 
-  const session = sessionManager.getSession(sessionId);
-  if (!session) {
-    logger.warn("Message received for invalid or expired session");
-    return c.json({
-      error: "invalid_session",
-      error_description: "Session not found or expired"
-    }, 404);
+  const { incoming, outgoing } = nodeReqRes(c);
+  await transport.handleRequest(incoming, outgoing, body);
+  return RESPONSE_ALREADY_SENT as unknown as Response;
+}
+
+// GET = the optional server->client SSE stream for an established session.
+export async function handleMcpGet(c: Context) {
+  const sessionId = c.req.header("mcp-session-id");
+  if (!sessionId || !transports[sessionId]) {
+    return c.json(
+      { jsonrpc: "2.0", error: { code: -32000, message: "Invalid or missing session ID" }, id: null },
+      400,
+    );
   }
+  const { incoming, outgoing } = nodeReqRes(c);
+  await transports[sessionId].handleRequest(incoming, outgoing);
+  return RESPONSE_ALREADY_SENT as unknown as Response;
+}
 
-  try {
-    const message = await c.req.json() as JSONRPCMessage;
-
-    await session.transport.handleIncomingMessage(message);
-
-    return c.body(null, 202);
-  } catch {
-    logger.error("Failed to process incoming MCP message");
-    return c.json({
-      error: "internal_error",
-      error_description: "Failed to process message"
-    }, 500);
+// DELETE = explicit session teardown.
+export async function handleMcpDelete(c: Context) {
+  const sessionId = c.req.header("mcp-session-id");
+  if (!sessionId || !transports[sessionId]) {
+    return c.json(
+      { jsonrpc: "2.0", error: { code: -32000, message: "Invalid or missing session ID" }, id: null },
+      400,
+    );
   }
+  const { incoming, outgoing } = nodeReqRes(c);
+  await transports[sessionId].handleRequest(incoming, outgoing);
+  return RESPONSE_ALREADY_SENT as unknown as Response;
 }
