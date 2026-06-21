@@ -55,6 +55,13 @@ export async function handleMcpPost(c: Context) {
     );
     registerAllTools(server, mcpToken);
     await server.connect(transport);
+  } else if (sessionId) {
+    // Unknown/expired session (e.g. after a server restart) -> 404 so the client
+    // re-initializes a fresh session instead of erroring (MCP spec behavior).
+    return c.json(
+      { jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null },
+      404,
+    );
   } else {
     return c.json(
       { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: no valid session ID" }, id: null },
@@ -72,8 +79,8 @@ export async function handleMcpGet(c: Context) {
   const sessionId = c.req.header("mcp-session-id");
   if (!sessionId || !transports[sessionId]) {
     return c.json(
-      { jsonrpc: "2.0", error: { code: -32000, message: "Invalid or missing session ID" }, id: null },
-      400,
+      { jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null },
+      404,
     );
   }
   const { incoming, outgoing } = nodeReqRes(c);
@@ -86,8 +93,8 @@ export async function handleMcpDelete(c: Context) {
   const sessionId = c.req.header("mcp-session-id");
   if (!sessionId || !transports[sessionId]) {
     return c.json(
-      { jsonrpc: "2.0", error: { code: -32000, message: "Invalid or missing session ID" }, id: null },
-      400,
+      { jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null },
+      404,
     );
   }
   const { incoming, outgoing } = nodeReqRes(c);

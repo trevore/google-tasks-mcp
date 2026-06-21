@@ -1,10 +1,11 @@
 import process from "node:process";
-import { Hono } from "hono";
+import { Hono, Context } from "hono";
 import { cors } from "hono/cors";
 import { readFile } from "node:fs/promises";
 import { createOAuthRouter } from "../auth/oauth.ts";
 import { authenticateBearer } from "./middleware.ts";
 import { handleMcpGet, handleMcpPost, handleMcpDelete } from "./mcp-endpoints.ts";
+import { publicBaseUrl } from "./base-url.ts";
 
 export interface ServerConfig {
   oauthConfig: {
@@ -83,8 +84,20 @@ export function createApp(config: ServerConfig) {
   app.post(MCP_ENDPOINT, authenticateBearer, handleMcpPost);
   app.delete(MCP_ENDPOINT, authenticateBearer, handleMcpDelete);
 
+  const protectedResourceMetadata = (c: Context) => {
+    const baseUrl = publicBaseUrl(c);
+    return c.json({
+      resource: `${baseUrl}${MCP_ENDPOINT}`,
+      authorization_servers: [baseUrl],
+      scopes_supported: [],
+      bearer_methods_supported: ["header"],
+    });
+  };
+  app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
+  app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
+
   app.get("/.well-known/oauth-authorization-server", (c) => {
-    const baseUrl = new URL(c.req.url).origin;
+    const baseUrl = publicBaseUrl(c);
     return c.json({
       issuer: baseUrl,
       authorization_endpoint: `${baseUrl}/authorize`,
