@@ -1,0 +1,7 @@
+.git
+node_modules
+build
+*.md
+.env
+.env.*
+deno.lock

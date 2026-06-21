@@ -2,9 +2,11 @@ import { Buffer } from "node:buffer";
 import { Hono } from "hono";
 import { tokenStore } from "./token-store.ts";
 import crypto from "node:crypto";
+import process from "node:process";
 import { openKv } from "@deno/kv";
 import { createLogger } from "../utils/logger.ts";
 import { rateLimit } from "../server/rate-limiter.ts";
+import { getRedirectAllowlist, isAllowedRedirectUri, verifyPkceS256 } from "./validation.ts";
 
 const logger = createLogger({ component: "oauth" });
 
@@ -42,7 +44,7 @@ class OAuthStore {
   private kv: Awaited<ReturnType<typeof openKv>> | null = null;
 
   async init() {
-    this.kv = await openKv();
+    this.kv = await openKv(process.env.DENO_KV_PATH);
   }
 
   async storeSession(sessionId: string, session: OAuthSession): Promise<void> {
@@ -91,17 +93,6 @@ class OAuthStore {
 
 const oauthStore = new OAuthStore();
 
-function base64URLEncode(str: Buffer): string {
-  return str.toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=/g, '');
-}
-
-function sha256(buffer: string): Buffer {
-  return crypto.createHash('sha256').update(buffer).digest();
-}
-
 export async function initOAuthStore() {
   await oauthStore.init();
 }
@@ -114,18 +105,34 @@ export function createOAuthRouter(config: OAuthConfig) {
     rateLimit({ maxRequests: 30, windowMs: 3600000 }),
     async (c) => {
       const body = await c.req.json();
-      const clientId = crypto.randomUUID();
+      const requestedRedirects: string[] = Array.isArray(body.redirect_uris)
+        ? body.redirect_uris
+        : [];
 
+      // Open DCR endpoint: only allow registering redirect URIs that are in the
+      // server allowlist, so a hostile registration cannot smuggle in an evil
+      // redirect target (closes the T1 open-redirect class even with open DCR).
+      const allowlist = getRedirectAllowlist();
+      const invalid = requestedRedirects.filter((u) => !isAllowedRedirectUri(u, allowlist));
+      if (requestedRedirects.length === 0 || invalid.length > 0) {
+        logger.warn("OAuth client registration rejected: redirect_uri not allowlisted");
+        return c.json({
+          error: "invalid_redirect_uri",
+          error_description: "redirect_uris must all be present in the server's OAUTH_REDIRECT_ALLOWLIST",
+        }, 400);
+      }
+
+      const clientId = crypto.randomUUID();
       await oauthStore.registerClient(clientId, {
         clientId,
-        redirectUris: body.redirect_uris || [],
+        redirectUris: requestedRedirects,
       });
 
       logger.info("OAuth client registered");
 
       return c.json({
         client_id: clientId,
-        redirect_uris: body.redirect_uris || [],
+        redirect_uris: requestedRedirects,
       });
     }
   );
@@ -146,6 +153,11 @@ export function createOAuthRouter(config: OAuthConfig) {
       return c.json({ error: "unsupported_response_type" }, 400);
     }
 
+    if (!clientId) {
+      logger.warn("OAuth authorization failed: missing client_id");
+      return c.json({ error: "invalid_request", error_description: "client_id is required" }, 400);
+    }
+
     if (!redirectUri) {
       logger.warn("OAuth authorization failed: missing redirect_uri");
       return c.json({ error: "invalid_request", error_description: "redirect_uri is required" }, 400);
@@ -154,6 +166,30 @@ export function createOAuthRouter(config: OAuthConfig) {
     if (!state) {
       logger.warn("OAuth authorization failed: missing state parameter");
       return c.json({ error: "invalid_request", error_description: "state parameter is required for CSRF protection" }, 400);
+    }
+
+    // PKCE is mandatory (S256). Upstream only enforced PKCE when a challenge
+    // happened to be present, letting an attacker simply omit it.
+    if (!codeChallenge || codeChallengeMethod !== "S256") {
+      logger.warn("OAuth authorization failed: PKCE S256 required");
+      return c.json({ error: "invalid_request", error_description: "code_challenge with code_challenge_method=S256 is required" }, 400);
+    }
+
+    // redirect_uri must be server-allowlisted AND registered to this client.
+    const allowlist = getRedirectAllowlist();
+    if (!isAllowedRedirectUri(redirectUri, allowlist)) {
+      logger.warn("OAuth authorization failed: redirect_uri not allowlisted");
+      return c.json({ error: "invalid_request", error_description: "redirect_uri is not allowed" }, 400);
+    }
+
+    const client = await oauthStore.getClient(clientId);
+    if (!client) {
+      logger.warn("OAuth authorization failed: unknown client_id");
+      return c.json({ error: "invalid_client", error_description: "unknown client_id" }, 400);
+    }
+    if (!client.redirectUris.includes(redirectUri)) {
+      logger.warn("OAuth authorization failed: redirect_uri not registered for client");
+      return c.json({ error: "invalid_request", error_description: "redirect_uri does not match a registered redirect_uri" }, 400);
     }
 
     logger.info("Starting OAuth authorization flow");
@@ -244,17 +280,15 @@ export function createOAuthRouter(config: OAuthConfig) {
       return c.json({ error: "invalid_grant", error_description: "redirect_uri does not match authorization request" }, 400);
     }
 
-    if (authCodeData.codeChallenge) {
-      if (!codeVerifier) {
-        logger.warn("PKCE validation failed: missing code_verifier");
-        return c.json({ error: "invalid_request", error_description: "code_verifier required" }, 400);
-      }
+    if (!isAllowedRedirectUri(redirectUri, getRedirectAllowlist())) {
+      logger.warn("Token exchange failed: redirect_uri not allowlisted");
+      return c.json({ error: "invalid_grant", error_description: "redirect_uri is not allowed" }, 400);
+    }
 
-      const hash = base64URLEncode(sha256(codeVerifier));
-      if (hash !== authCodeData.codeChallenge) {
-        logger.warn("PKCE validation failed: invalid code_verifier");
-        return c.json({ error: "invalid_grant", error_description: "invalid code_verifier" }, 400);
-      }
+    // PKCE is mandatory: the auth code must carry a challenge and the verifier must match.
+    if (!verifyPkceS256(codeVerifier, authCodeData.codeChallenge)) {
+      logger.warn("PKCE validation failed");
+      return c.json({ error: "invalid_grant", error_description: "invalid or missing PKCE code_verifier" }, 400);
     }
 
     try {
