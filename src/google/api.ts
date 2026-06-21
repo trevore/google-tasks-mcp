@@ -2,6 +2,7 @@ import { tokenStore } from "../auth/token-store.ts";
 import { refreshGoogleToken } from "../auth/oauth.ts";
 import { getOAuthConfig } from "../config.ts";
 import { createLogger } from "../utils/logger.ts";
+import { parseResponseBody } from "./parse-response.ts";
 
 const logger = createLogger({ component: "google-api" });
 
@@ -52,7 +53,7 @@ async function makeGoogleRequest(
     throw new Error(`Google API error: ${response.status} - ${error}`);
   }
 
-  return response.json();
+  return parseResponseBody(response);
 }
 
 export function listTaskLists(mcpToken: string, maxResults?: number, pageToken?: string) {
