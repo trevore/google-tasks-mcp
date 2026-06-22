@@ -19,6 +19,11 @@ export function rateLimit(config: RateLimitConfig) {
       return;
     }
 
+    // SECURITY: x-forwarded-for / x-real-ip are client-controllable headers. A
+    // client can forge them to bypass or evade per-IP limits, so this limiter
+    // relies on the trusted reverse proxy in front (Caddy with the Anthropic-IP
+    // allowlist, per FORK-HARDENING.md) to set/overwrite X-Forwarded-For with
+    // the real source IP. Without that proxy, the per-IP limits are spoofable.
     const ip = c.req.header("x-forwarded-for") || c.req.header("x-real-ip") || "unknown";
     const key = ["rate_limit", c.req.path, ip];
 

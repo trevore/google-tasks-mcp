@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "description": "MCP server for Google Tasks API integration",
   "type": "module",
-  "main": "build/index.js",
+  "main": "build/main.js",
   "scripts": {
-    "build": "tsc",
+    "clean": "rm -rf build",
+    "build": "rm -rf build && tsc",
     "dev": "tsc --watch",
     "generate-secret": "node -e \"console.log('ENCRYPTION_SECRET=' + require('crypto').randomBytes(32).toString('hex'))\""
   },

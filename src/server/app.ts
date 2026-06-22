@@ -6,6 +6,9 @@ import { createOAuthRouter } from "../auth/oauth.ts";
 import { authenticateBearer } from "./middleware.ts";
 import { handleMcpGet, handleMcpPost, handleMcpDelete } from "./mcp-endpoints.ts";
 import { publicBaseUrl } from "./base-url.ts";
+import { createLogger } from "../utils/logger.ts";
+
+const logger = createLogger({ component: "app" });
 
 export interface ServerConfig {
   oauthConfig: {
@@ -141,7 +144,10 @@ export function createApp(config: ServerConfig) {
   });
 
   app.onError((err, c) => {
-    console.error("Unhandled error:", err);
+    // Route through the redacting logger (not raw console.error) so that any
+    // token/secret accidentally embedded in the error object is scrubbed before
+    // hitting stdout/stderr. Response behavior below is unchanged.
+    logger.error("Unhandled error", { error: String(err) });
     return c.json({
       error: "internal_server_error",
       error_description: "An internal server error occurred. Please try again later."

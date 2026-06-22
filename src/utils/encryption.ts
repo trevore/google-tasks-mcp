@@ -18,6 +18,12 @@ function getEncryptionKey(): Buffer {
     throw new Error("ENCRYPTION_SECRET must be at least 32 characters long");
   }
 
+  // NOTE: This salt is a fixed, hardcoded constant — it is NOT per-record.
+  // The derived key therefore depends solely on ENCRYPTION_SECRET, so two
+  // deploys configured with identical secrets derive identical keys (and can
+  // decrypt each other's tokens). Do NOT change this salt: doing so would
+  // change the derived key and make all already-stored encrypted tokens
+  // undecryptable.
   const salt = Buffer.from("google-tasks-mcp-salt");
   return crypto.pbkdf2Sync(secret, salt, ITERATIONS, KEY_LENGTH, "sha256");
 }
@@ -25,6 +31,10 @@ function getEncryptionKey(): Buffer {
 export function encrypt(text: string): string {
   const key = getEncryptionKey();
   const iv = crypto.randomBytes(IV_LENGTH);
+  // These random salt bytes are prepended to each record but are NOT used in
+  // key derivation (decrypt() reads them into a variable it never uses — see
+  // `_salt` below). They are effectively decorative for this scheme. Semantic
+  // security comes from the AES-GCM IV, which IS random per record (above).
   const salt = crypto.randomBytes(SALT_LENGTH);
 
   const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
@@ -42,6 +52,10 @@ export function decrypt(encryptedData: string): string {
   const key = getEncryptionKey();
   const buffer = Buffer.from(encryptedData, "base64");
 
+  // The per-record salt is parsed out for layout/offset purposes only; it is
+  // intentionally unused in key derivation (the key derives from the fixed
+  // constant salt in getEncryptionKey()). The random per-record AES-GCM IV
+  // below is what provides semantic security.
   const _salt = buffer.subarray(0, SALT_LENGTH);
   const iv = buffer.subarray(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);
   const tag = buffer.subarray(
