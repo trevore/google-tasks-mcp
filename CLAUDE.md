@@ -20,7 +20,9 @@ No test framework is configured.
 
 ### Entry Point & Runtime
 
-`src/index.ts` initializes Deno KV stores (tokens, OAuth sessions, rate limiter), sets OAuth config from env vars, creates the Hono app, and exports `{ fetch: app.fetch }` for Deno Deploy.
+The canonical entrypoint is `build/main.js` (compiled from `src/main.ts`) — the hardened server that initializes Deno KV stores (tokens, OAuth sessions, rate limiter), sets OAuth config from env vars, creates the Hono app, and binds `HOST`/`PORT` to open a listening socket. This is what `package.json`'s `main` points at and what the Dockerfile runs.
+
+`src/index.ts` is the no-socket fetch handler: it initializes the same stores/config and creates the Hono app but only exports `{ fetch: app.fetch }` (for Deno Deploy / edge-style hosting). It opens no socket and is **not** the server entrypoint.
 
 ### Request Flow
 
